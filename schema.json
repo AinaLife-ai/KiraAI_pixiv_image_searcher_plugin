@@ -148,5 +148,11 @@
     "default": "tags",
     "options": ["tags", "title"],
     "hint": "tags=优先标签，title=优先标题+简介（仅在开启标题搜索时生效）"
+  },
+  "enable_search_fallback": {
+    "type": "switch",
+    "name": "搜索模式互相降级",
+    "default": true,
+    "hint": "开启后，关键词搜索无结果时自动尝试画师搜索；画师搜索无结果时自动尝试关键词搜索"
   }
 }
