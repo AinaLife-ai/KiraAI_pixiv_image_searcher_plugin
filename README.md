@@ -67,6 +67,7 @@ KiraAI/
 | **每次清理旧文件数量** | 20 | 每次清理最古老的文件数 |
 | **开启标题和简介搜索** | 开启 | 关闭后只搜索标签，不搜索标题和简介 |
 | **优先搜索项** | tags | `tags`=优先标签，`title`=优先标题+简介（仅在开启标题搜索时生效）。若优先搜索无结果，自动回退到另一种模式 |
+| **搜索模式互相降级** | 开启 | 开启后，关键词搜索无结果时自动尝试画师搜索；画师搜索无结果时自动尝试关键词搜索 |
 
 
 ## 如何获取 Refresh Token
@@ -215,6 +216,7 @@ pixivpy>=3.7.0
 - [get-pixivpy-token](https://github.com/eggplants/get-pixivpy-token) — refresh_token 获取工具参考
 - [Alife.Plugin.PixivSearcher](https://github.com/woqichino/Alife.Plugin.PixivSearcher) — 智乃喵基于本项目学习后制作了画师搜索功能，对其`pixiv_search_by_artist` 工具参考和反向移植
 
+
 ## 更新日志
 
 <details>
@@ -224,9 +226,11 @@ pixivpy>=3.7.0
 
 **新增**
 - 👤 **画师搜索工具**：新增 `pixiv_search_by_artist` 工具，支持按画师 ID 或画师名字搜索其作品并发送，与 C# 版 `PixivsearchArtist` 对齐
+- 🔄 **搜索模式互相降级**：新增 `enable_search_fallback` 配置项，开启后关键词搜索无结果自动尝试画师搜索，画师搜索无结果自动尝试关键词搜索，防止 LLM 选错工具
 
 **优化**
 - ♻️ 提取 `_download_and_send_illusts` 通用发送函数，关键词搜索与画师搜索共用同一套下载、去重、R-18 过滤、合并转发逻辑
+- ♻️ 抽取 `_try_keyword_search` 和 `_try_artist_search` 带重试的搜索封装，两个工具共用同一套认证错误处理
 
 ### v1.3.6 (2026-06-29)
 
