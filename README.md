@@ -14,6 +14,7 @@
 - 🧹 自动清理本地图片缓存
 - 🔁 自动重认证：Access Token 过期时自动用 Refresh Token 刷新，无需手动重载插件
 - ⏱️ 可配置请求超时时间，防止网络卡顿导致工具调用失败
+- 👤 支持按画师 ID 或名字搜索其作品
 
 ## 适用场景
 
@@ -110,6 +111,8 @@ gppt login -j
 来张原神图
 给我看看泳装
 发3张白丝，要原图
+发几张米山舞的图
+画师 米山舞 来3张
 ```
 
 机器人会自动调用插件，搜索并发送图片。
@@ -122,6 +125,8 @@ gppt login -j
 | "发点1000user的图" | 搜索 `1000users入り`，质量通常很高，可同时说其他标签 |
 | "发3张原神图" | 搜索 `原神`，发3张 |
 | "这张发原图" / "发原图 12345678" | 按作品 ID 发原图 |
+| "发几张米山舞的图" | 搜索画师 `米山舞`，取其作品发送 |
+| "画师 1234567 来5张" | 按画师 ID 搜索，发5张 |
 | "再来点" | 继续搜索并发送（24h 后会重复） |
 
 
@@ -139,6 +144,7 @@ gppt login -j
 - 增加"最大搜索页数"
 - 检查网络/代理是否能正常访问 Pixiv
 - 如果关键词是作品标题或作者名，可开启"开启标题和简介搜索"，并尝试将"优先搜索项"改为 `title`
+- 如果想按画师搜索，可以直接说"发几张 XXX 的图"或"画师 XXX 来 N 张"，机器人会调用 `pixiv_search_by_artist` 工具
 
 ### 3. 图片发不出来
 
@@ -207,12 +213,20 @@ pixivpy>=3.7.0
 
 - [pixivpy](https://github.com/upbit/pixivpy) — Pixiv API 客户端
 - [get-pixivpy-token](https://github.com/eggplants/get-pixivpy-token) — refresh_token 获取工具参考
-
+- [Alife.Plugin.PixivSearcher](https://github.com/woqichino/Alife.Plugin.PixivSearcher) — 智乃喵基于本项目学习后制作了画师搜索功能，对其`pixiv_search_by_artist` 工具参考和反向移植
 
 ## 更新日志
 
 <details>
 <summary><b>📝 点击展开查看更新日志</b></summary>
+
+### v1.4.0 (2026-07-05)
+
+**新增**
+- 👤 **画师搜索工具**：新增 `pixiv_search_by_artist` 工具，支持按画师 ID 或画师名字搜索其作品并发送，与 C# 版 `PixivsearchArtist` 对齐
+
+**优化**
+- ♻️ 提取 `_download_and_send_illusts` 通用发送函数，关键词搜索与画师搜索共用同一套下载、去重、R-18 过滤、合并转发逻辑
 
 ### v1.3.6 (2026-06-29)
 
