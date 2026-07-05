@@ -68,6 +68,7 @@ class PixivPlugin(BasePlugin):
         self.keyword_map = {**DEFAULT_KEYWORD_MAP, **dict(cfg.get("keyword_map", {}))}
         self.enable_title_search = cfg.get("enable_title_search", True)
         self.search_priority = cfg.get("search_priority", "tags")
+        self.enable_search_fallback = cfg.get("enable_search_fallback", True)
         self.timeout = cfg.get("timeout", 90)  # ⭐ 超时配置，默认90秒
         self.api = None
         self._sent_ids: dict[str, float] = {}
@@ -503,6 +504,61 @@ class PixivPlugin(BasePlugin):
             logger.warning(f"搜索画师 {name} 失败: {e}")
             return None
 
+    # ---------- 带重试的搜索封装 ----------
+    async def _try_keyword_search(
+        self,
+        keyword: str,
+        count: int,
+        is_dm: bool,
+        sid: str,
+    ) -> tuple[bool, List[str], str]:
+        """尝试关键词搜索（带自动重试），返回 (是否成功, 作品ID列表, 错误信息)"""
+        max_retries = 2
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                ids = await self._fetch_ids(keyword, count, is_dm, sid)
+                return True, ids, ""
+            except Exception as e:
+                last_error = e
+                if self._is_auth_exception(e) and attempt < max_retries - 1:
+                    logger.warning(f"关键词搜索时发生认证错误: {e}，尝试重新认证...")
+                    if self._init_api():
+                        logger.info("重新认证成功，重试关键词搜索")
+                        continue
+                    else:
+                        logger.error("重新认证失败")
+                        break
+                break
+        return False, [], str(last_error) if last_error else "关键词搜索失败"
+
+    async def _try_artist_search(
+        self,
+        artist: str,
+        count: int,
+        is_dm: bool,
+        sid: str,
+    ) -> tuple[bool, List[str], str]:
+        """尝试画师搜索（带自动重试），返回 (是否成功, 作品ID列表, 错误信息)"""
+        max_retries = 2
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                ids = await self._fetch_artist_ids(artist, count, is_dm, sid)
+                return True, ids, ""
+            except Exception as e:
+                last_error = e
+                if self._is_auth_exception(e) and attempt < max_retries - 1:
+                    logger.warning(f"画师搜索时发生认证错误: {e}，尝试重新认证...")
+                    if self._init_api():
+                        logger.info("重新认证成功，重试画师搜索")
+                        continue
+                    else:
+                        logger.error("重新认证失败")
+                        break
+                break
+        return False, [], str(last_error) if last_error else "画师搜索失败"
+
     # ---------- 下载 ----------
     def _download_image_sync(self, img_url: str, illust_id: str) -> str | None:
         if not self.api:
@@ -812,40 +868,34 @@ class PixivPlugin(BasePlugin):
             return f"发送失败：重试后仍失败"
 
         # ---- 搜索模式 ----
-        max_retries = 2
-        ids = []
-        last_error = None
+        primary_ok, ids, primary_err = await self._try_keyword_search(search_keyword, count, is_dm, sid)
+        if primary_ok and ids:
+            return await self._download_and_send_illusts(
+                event,
+                ids[:count],
+                use_original,
+                f"关键词「{search_keyword}」",
+            )
 
-        for attempt in range(max_retries):
-            try:
-                ids = await self._fetch_ids(search_keyword, count, is_dm, sid)
-                if ids:
-                    break
-                else:
-                    return f"无结果（关键词：{search_keyword}）"
-            except Exception as e:
-                last_error = e
-                if self._is_auth_exception(e) and attempt < max_retries - 1:
-                    logger.warning(f"搜索时发生认证错误: {e}，尝试重新认证...")
-                    if self._init_api():
-                        logger.info("重新认证成功，重试搜索")
-                        continue
-                    else:
-                        logger.error("重新认证失败")
-                        break
-                else:
-                    break
+        if not self.enable_search_fallback:
+            if primary_ok:
+                return f"无结果（关键词：{search_keyword}）"
+            return f"搜索失败：{primary_err}"
 
-        if not ids:
-            return f"搜索失败：{str(last_error) if last_error else '无结果或未知错误'}"
+        # 关键词无结果，降级到画师搜索
+        logger.info(f"关键词搜索「{search_keyword}」无结果，尝试降级到画师搜索")
+        fallback_ok, artist_ids, fallback_err = await self._try_artist_search(keyword, count, is_dm, sid)
+        if fallback_ok and artist_ids:
+            return await self._download_and_send_illusts(
+                event,
+                artist_ids[:count],
+                use_original,
+                f"画师「{keyword}」（关键词搜索无结果，自动降级）",
+            )
 
-        # ---- 下载并发送 ----
-        return await self._download_and_send_illusts(
-            event,
-            ids[:count],
-            use_original,
-            f"关键词「{search_keyword}」",
-        )
+        if primary_ok and fallback_ok:
+            return f"无结果（关键词：{search_keyword}，画师：{keyword}）"
+        return f"搜索失败：关键词模式 {primary_err}，画师模式 {fallback_err}"
 
     @tool(
         "pixiv_search_by_artist",
@@ -881,36 +931,33 @@ class PixivPlugin(BasePlugin):
 
         self._cleanup_storage()
 
-        max_retries = 2
-        ids = []
-        last_error = None
+        # ---- 画师搜索模式 ----
+        primary_ok, ids, primary_err = await self._try_artist_search(artist, count, is_dm, sid)
+        if primary_ok and ids:
+            return await self._download_and_send_illusts(
+                event,
+                ids[:count],
+                use_original,
+                f"画师「{artist}」",
+            )
 
-        for attempt in range(max_retries):
-            try:
-                ids = await self._fetch_artist_ids(artist, count, is_dm, sid)
-                if ids:
-                    break
-                else:
-                    return f"无结果（画师：{artist}）"
-            except Exception as e:
-                last_error = e
-                if self._is_auth_exception(e) and attempt < max_retries - 1:
-                    logger.warning(f"画师搜索时发生认证错误: {e}，尝试重新认证...")
-                    if self._init_api():
-                        logger.info("重新认证成功，重试画师搜索")
-                        continue
-                    else:
-                        logger.error("重新认证失败")
-                        break
-                else:
-                    break
+        if not self.enable_search_fallback:
+            if primary_ok:
+                return f"无结果（画师：{artist}）"
+            return f"画师搜索失败：{primary_err}"
 
-        if not ids:
-            return f"画师搜索失败：{str(last_error) if last_error else '无结果或未知错误'}"
+        # 画师搜索无结果，降级到关键词搜索
+        logger.info(f"画师搜索「{artist}」无结果，尝试降级到关键词搜索")
+        search_keyword = self._normalize_keyword(artist)
+        fallback_ok, keyword_ids, fallback_err = await self._try_keyword_search(search_keyword, count, is_dm, sid)
+        if fallback_ok and keyword_ids:
+            return await self._download_and_send_illusts(
+                event,
+                keyword_ids[:count],
+                use_original,
+                f"关键词「{search_keyword}」（画师搜索无结果，自动降级）",
+            )
 
-        return await self._download_and_send_illusts(
-            event,
-            ids[:count],
-            use_original,
-            f"画师「{artist}」",
-        )
+        if primary_ok and fallback_ok:
+            return f"无结果（画师：{artist}，关键词：{search_keyword}）"
+        return f"搜索失败：画师模式 {primary_err}，关键词模式 {fallback_err}"
