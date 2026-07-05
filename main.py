@@ -399,6 +399,110 @@ class PixivPlugin(BasePlugin):
         except asyncio.TimeoutError:
             raise TimeoutError(f"Pixiv 搜索超时（{self.timeout} 秒）")
 
+    # ---------- 画师搜索 ----------
+    async def _fetch_artist_ids(self, artist: str, count: int, is_dm: bool, sid: str) -> List[str]:
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, self._fetch_artist_ids_sync, artist, count, is_dm, sid),
+                timeout=self.timeout
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"Pixiv 画师搜索超时（{self.timeout} 秒）")
+
+    def _fetch_artist_ids_sync(self, artist: str, count: int, is_dm: bool, sid: str) -> List[str]:
+        if not self.api:
+            raise RuntimeError("API 未初始化")
+
+        # 数字 ID 直接作为 user_id
+        if artist.isdigit():
+            user_id = artist
+        else:
+            user_id = self._search_user_id_by_name_sync(artist)
+            if not user_id:
+                return []
+
+        logger.info(f"开始获取画师 {artist} (user_id={user_id}) 的作品")
+        illusts = self._fetch_artist_illusts_sync(user_id)
+        if not illusts:
+            return []
+
+        return self._filter_and_sort_illusts(illusts, count, is_dm, sid)
+
+    def _fetch_artist_illusts_sync(self, user_id: str) -> List:
+        url = "%s/v1/user/illusts" % self.api.hosts
+        all_illusts = []
+        next_url = None
+        for page in range(self.max_search_pages):
+            try:
+                if page == 0:
+                    params = {
+                        "user_id": user_id,
+                        "type": "illust",
+                        "filter": "for_ios",
+                    }
+                    r = self._call_with_reauth(self.api.no_auth_requests_call, "GET", url, params=params, req_auth=True)
+                    result = self.api.parse_result(r)
+                else:
+                    result = self.api.parse_qs(next_url)
+
+                if result is None:
+                    break
+                if self._is_auth_error_from_result(result):
+                    raise RuntimeError("Authentication error in user_illusts response")
+                if isinstance(result, dict) and result.get("error"):
+                    logger.error(f"API 返回错误: {result['error']}")
+                    break
+                if hasattr(result, "error") and result.error:
+                    logger.error(f"API 返回错误: {result.error}")
+                    break
+
+                illusts = getattr(result, "illusts", None) or []
+                if not illusts:
+                    break
+                all_illusts.extend(illusts)
+                next_url = getattr(result, "next_url", None)
+                if not next_url:
+                    break
+            except Exception as e:
+                logger.error(f"获取画师 {user_id} 作品第 {page} 页失败: {e}")
+                break
+        return all_illusts
+
+    def _search_user_id_by_name_sync(self, name: str) -> str | None:
+        url = "%s/v1/search/user" % self.api.hosts
+        params = {
+            "word": name,
+            "sort": "popular_desc",
+        }
+        try:
+            r = self._call_with_reauth(self.api.no_auth_requests_call, "GET", url, params=params, req_auth=True)
+            result = self.api.parse_result(r)
+            if result is None:
+                return None
+            if self._is_auth_error_from_result(result):
+                raise RuntimeError("Authentication error in search_user response")
+            if isinstance(result, dict) and result.get("error"):
+                logger.error(f"API 返回错误: {result['error']}")
+                return None
+            if hasattr(result, "error") and result.error:
+                logger.error(f"API 返回错误: {result.error}")
+                return None
+
+            user_previews = getattr(result, "user_previews", None) or []
+            if not user_previews:
+                logger.warning(f"未找到画师: {name}")
+                return None
+
+            user = user_previews[0].user
+            user_id = str(user.id)
+            user_name = getattr(user, "name", name)
+            logger.info(f"找到画师: {user_name} (ID: {user_id})")
+            return user_id
+        except Exception as e:
+            logger.warning(f"搜索画师 {name} 失败: {e}")
+            return None
+
     # ---------- 下载 ----------
     def _download_image_sync(self, img_url: str, illust_id: str) -> str | None:
         if not self.api:
@@ -565,10 +669,79 @@ class PixivPlugin(BasePlugin):
             logger.error(f"处理作品 {illust_id} 失败: {e}")
             return False, str(e)
 
+    # ---------- 通用发送 ----------
+    async def _download_and_send_illusts(
+        self,
+        event: KiraMessageBatchEvent,
+        ids: List[str],
+        use_original: bool,
+        source_description: str,
+    ) -> str:
+        """下载并发送一组作品 ID，返回最终提示文本"""
+        pending: List[tuple[str, str]] = []
+        for wid in ids:
+            try:
+                detail = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: self._call_with_reauth(self.api.illust_detail, wid)
+                )
+                if not detail or not hasattr(detail, "illust"):
+                    continue
+
+                illust = detail.illust
+                img_url = self._get_image_url(illust, use_original)
+                if not img_url:
+                    continue
+
+                local_path = await self._download_image(img_url, wid)
+                if not local_path:
+                    continue
+
+                pending.append((wid, local_path))
+            except Exception as e:
+                logger.error(f"处理图片 {wid} 失败: {e}")
+
+        if not pending:
+            return "发送失败（下载图片失败）"
+
+        local_paths = [p[1] for p in pending]
+        if self.send_as_forward:
+            send_ok = await self._send_forward_images(event, local_paths)
+            if not send_ok:
+                send_ok = True
+                for local_path in local_paths:
+                    if not await self._send_image_directly(event, local_path):
+                        send_ok = False
+        else:
+            send_ok = True
+            for local_path in local_paths:
+                if not await self._send_image_directly(event, local_path):
+                    send_ok = False
+
+        if not send_ok:
+            return "发送失败（QQ 发送失败）"
+
+        for wid, _ in pending:
+            self._mark_sent(wid)
+
+        sent_paths = [
+            f"data/{Path(p[1]).relative_to(Path(get_data_path())).as_posix()}"
+            for p in pending
+        ]
+        mode_text = "原图" if use_original else "预览图"
+        forward_text = "合并转发" if self.send_as_forward else "单条"
+        return (
+            f"已成功以{forward_text}形式发送 {len(pending)} 张{mode_text}到当前聊天。\n"
+            f"这些图片已由工具直接发送完毕，你无需再次发送，也无需使用 <file> 标签。\n"
+            f"只需简单回应用户即可。\n"
+            f"来源：{source_description}\n"
+            f"发送的文件：{', '.join(sent_paths)}"
+        )
+
     # ---------- 工具 ----------
     @tool(
         "pixiv_search_and_send",
-        "从 Pixiv 搜索高人气图片（按收藏数排序）并直接发送到当前聊天。支持过滤低收藏数和排除标签。默认发送预览图，可指定原图。",
+        "按关键词/标签搜索 Pixiv 高人气图片并直接发送到当前聊天。当用户说'来张XX图'、'发几张XX'时使用此工具。支持过滤低收藏数和排除标签。默认发送预览图，可指定原图。",
         {
             "type": "object",
             "properties": {
@@ -667,61 +840,77 @@ class PixivPlugin(BasePlugin):
             return f"搜索失败：{str(last_error) if last_error else '无结果或未知错误'}"
 
         # ---- 下载并发送 ----
-        pending: List[tuple[str, str]] = []
-        for wid in ids[:count]:
+        return await self._download_and_send_illusts(
+            event,
+            ids[:count],
+            use_original,
+            f"关键词「{search_keyword}」",
+        )
+
+    @tool(
+        "pixiv_search_by_artist",
+        "按画师搜索 Pixiv 作品。当用户提到'XX画师的图'、'发几张XX的图'、'画师 XXX'或给出画师ID时使用此工具。会先根据名字查找画师ID，然后拉取该画师的作品。",
+        {
+            "type": "object",
+            "properties": {
+                "artist": {"type": "string", "description": "画师 ID（数字）或画师名字（如 米山舞）"},
+                "count": {"type": "integer", "default": 1, "description": "要获取的图片张数"},
+                "original": {"type": "boolean", "default": False, "description": "是否发送原图"},
+            },
+            "required": ["artist"],
+        },
+    )
+    async def pixiv_search_by_artist(self, event: KiraMessageBatchEvent, artist: str, count: int = 1, original: bool = False) -> str:
+        if not self.api and not self._init_api():
+            return "未初始化"
+
+        if not artist or not artist.strip():
+            return "无画师信息"
+
+        count = min(max(1, int(count)), self.max_count)
+        use_original = bool(original) or self.download_original
+        is_dm = self._is_dm(event)
+        sid = getattr(event, "sid", None)
+        if not sid:
+            last_msg = event.messages[-1]
+            adapter = event.adapter.name if event.adapter else "qq"
+            if hasattr(last_msg, "group") and last_msg.group:
+                sid = f"{adapter}:gm:{last_msg.group.group_id}"
+            else:
+                sid = f"{adapter}:dm:{last_msg.sender.user_id}"
+
+        self._cleanup_storage()
+
+        max_retries = 2
+        ids = []
+        last_error = None
+
+        for attempt in range(max_retries):
             try:
-                detail = await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda: self._call_with_reauth(self.api.illust_detail, wid)
-                )
-                if not detail or not hasattr(detail, "illust"):
-                    continue
-
-                illust = detail.illust
-                img_url = self._get_image_url(illust, use_original)
-                if not img_url:
-                    continue
-
-                local_path = await self._download_image(img_url, wid)
-                if not local_path:
-                    continue
-
-                pending.append((wid, local_path))
+                ids = await self._fetch_artist_ids(artist, count, is_dm, sid)
+                if ids:
+                    break
+                else:
+                    return f"无结果（画师：{artist}）"
             except Exception as e:
-                logger.error(f"处理图片 {wid} 失败: {e}")
+                last_error = e
+                if self._is_auth_exception(e) and attempt < max_retries - 1:
+                    logger.warning(f"画师搜索时发生认证错误: {e}，尝试重新认证...")
+                    if self._init_api():
+                        logger.info("重新认证成功，重试画师搜索")
+                        continue
+                    else:
+                        logger.error("重新认证失败")
+                        break
+                else:
+                    break
 
-        if not pending:
-            return "发送失败（下载图片失败）"
+        if not ids:
+            return f"画师搜索失败：{str(last_error) if last_error else '无结果或未知错误'}"
 
-        local_paths = [p[1] for p in pending]
-        if self.send_as_forward:
-            send_ok = await self._send_forward_images(event, local_paths)
-            if not send_ok:
-                send_ok = True
-                for local_path in local_paths:
-                    if not await self._send_image_directly(event, local_path):
-                        send_ok = False
-        else:
-            send_ok = True
-            for local_path in local_paths:
-                if not await self._send_image_directly(event, local_path):
-                    send_ok = False
-
-        if not send_ok:
-            return "发送失败（QQ 发送失败）"
-
-        for wid, _ in pending:
-            self._mark_sent(wid)
-
-        sent_paths = [
-            f"data/{Path(p[1]).relative_to(Path(get_data_path())).as_posix()}"
-            for p in pending
-        ]
-        mode_text = "原图" if use_original else "预览图"
-        forward_text = "合并转发" if self.send_as_forward else "单条"
-        return (
-            f"已成功以{forward_text}形式发送 {len(pending)} 张{mode_text}到当前聊天。\n"
-            f"这些图片已由工具直接发送完毕，你无需再次发送，也无需使用 <file> 标签。\n"
-            f"只需简单回应用户即可。\n"
-            f"发送的文件：{', '.join(sent_paths)}"
+        return await self._download_and_send_illusts(
+            event,
+            ids[:count],
+            use_original,
+            f"画师「{artist}」",
         )
