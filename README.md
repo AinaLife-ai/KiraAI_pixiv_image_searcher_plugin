@@ -1,5 +1,7 @@
 # Pixiv 图片搜索插件
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_pixiv_image_searcher_plugin)
+
 一个适用于 [KiraAI](https://github.com/) 的插件，用于从 Pixiv 搜索高人气图片并直接发送到 QQ 聊天。
 
 ## 功能
