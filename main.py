@@ -12,6 +12,27 @@ from core.utils.path_utils import get_data_path
 
 from pixivpy3 import AppPixivAPI
 
+
+def _session_id_of(event) -> str:
+    """取会话 id（`adapter_name:gm|dm:target`）。
+
+    取值顺序（**叠加，不丢**）：
+      1. `event.session.sid` —— 核心的权威会话 id（3.0 的批量事件没有 `event.sid`，但一定有它）；
+      2. `event.sid` —— 2.x 事件上的老字段；
+      3. 兜底：按 `适配器名 + 群/用户 id` 现场拼（与旧版**逐字一致**，保证 2.x 行为不变）。
+    """
+    sess = getattr(event, "session", None)
+    sid = getattr(sess, "sid", None) if sess is not None else None
+    if not sid:
+        sid = getattr(event, "sid", None)
+    if sid:
+        return str(sid)
+    last_msg = event.messages[-1]
+    adapter = event.adapter.name if event.adapter else "qq"
+    if hasattr(last_msg, "group") and last_msg.group:
+        return f"{adapter}:gm:{last_msg.group.group_id}"
+    return f"{adapter}:dm:{last_msg.sender.user_id}"
+
 logger = get_logger("pixiv_plugin", "cyan")
 
 # 常用中文关键词 -> Pixiv 日文/英文 tag 映射
@@ -603,14 +624,7 @@ class PixivPlugin(BasePlugin):
     # ---------- 发送 ----------
     async def _send_image_directly(self, event: KiraMessageBatchEvent, local_path: str) -> bool:
         try:
-            session_id = getattr(event, "sid", None)
-            if not session_id:
-                last_msg = event.messages[-1]
-                adapter = event.adapter.name if event.adapter else "qq"
-                if hasattr(last_msg, "group") and last_msg.group:
-                    session_id = f"{adapter}:gm:{last_msg.group.group_id}"
-                else:
-                    session_id = f"{adapter}:dm:{last_msg.sender.user_id}"
+            session_id = _session_id_of(event)
 
             img = Image(local_path, caption="")
             chain = MessageChain([img])
@@ -620,18 +634,27 @@ class PixivPlugin(BasePlugin):
             logger.error(f"直接发送图片失败: {e}")
             return False
 
+    def _can_forward(self, event) -> bool:
+        """当前平台是否支持 OneBot 式合并转发。
+
+        QQ 官方机器人（OpenAPI）的客户端**没有** `send_action`（那是 OneBot 系的能力），
+        所以官方平台下**直接走单条直发** —— 结果与"转发失败后回退"完全相同，
+        但不再抛异常、不再刷一条 error 日志。OneBot 系返回值不变（照旧合并转发）。
+        """
+        try:
+            sid = _session_id_of(event)
+            adapter_name = str(sid).split(":")[0]
+            inst = self.ctx.adapter_mgr.get_adapter(adapter_name)
+            client = inst.get_client() if inst else None
+            return callable(getattr(client, "send_action", None))
+        except Exception:
+            return False
+
     async def _send_forward_images(self, event: KiraMessageBatchEvent, local_paths: List[str]) -> bool:
         if not local_paths:
             return False
         try:
-            session_id = getattr(event, "sid", None)
-            if not session_id:
-                last_msg = event.messages[-1]
-                adapter = event.adapter.name if event.adapter else "qq"
-                if hasattr(last_msg, "group") and last_msg.group:
-                    session_id = f"{adapter}:gm:{last_msg.group.group_id}"
-                else:
-                    session_id = f"{adapter}:dm:{last_msg.sender.user_id}"
+            session_id = _session_id_of(event)
 
             parts = session_id.split(":")
             if len(parts) != 3:
@@ -761,7 +784,18 @@ class PixivPlugin(BasePlugin):
             return "发送失败（下载图片失败）"
 
         local_paths = [p[1] for p in pending]
-        if self.send_as_forward:
+        if self.send_as_forward and not self._can_forward(event):
+            if not getattr(self, "_fwd_unsupported_logged", False):
+                self._fwd_unsupported_logged = True
+                logger.info(
+                    "[pixiv] 当前平台不支持合并转发（QQ 官方 OpenAPI 没有 send_action）"
+                    "⇒ 本次按**单条直发**（效果与转发失败后回退相同，但不报错）。"
+                    "如需彻底静音可把配置项 send_as_forward 关掉")
+            send_ok = True
+            for local_path in local_paths:
+                if not await self._send_image_directly(event, local_path):
+                    send_ok = False
+        elif self.send_as_forward:
             send_ok = await self._send_forward_images(event, local_paths)
             if not send_ok:
                 send_ok = True
@@ -818,14 +852,7 @@ class PixivPlugin(BasePlugin):
         count = min(max(1, int(count)), self.max_count)
         use_original = bool(original) or self.download_original
         is_dm = self._is_dm(event)
-        sid = getattr(event, "sid", None)
-        if not sid:
-            last_msg = event.messages[-1]
-            adapter = event.adapter.name if event.adapter else "qq"
-            if hasattr(last_msg, "group") and last_msg.group:
-                sid = f"{adapter}:gm:{last_msg.group.group_id}"
-            else:
-                sid = f"{adapter}:dm:{last_msg.sender.user_id}"
+        sid = _session_id_of(event)
 
         self._cleanup_storage()
         search_keyword = self._normalize_keyword(keyword)
@@ -920,14 +947,7 @@ class PixivPlugin(BasePlugin):
         count = min(max(1, int(count)), self.max_count)
         use_original = bool(original) or self.download_original
         is_dm = self._is_dm(event)
-        sid = getattr(event, "sid", None)
-        if not sid:
-            last_msg = event.messages[-1]
-            adapter = event.adapter.name if event.adapter else "qq"
-            if hasattr(last_msg, "group") and last_msg.group:
-                sid = f"{adapter}:gm:{last_msg.group.group_id}"
-            else:
-                sid = f"{adapter}:dm:{last_msg.sender.user_id}"
+        sid = _session_id_of(event)
 
         self._cleanup_storage()
 
